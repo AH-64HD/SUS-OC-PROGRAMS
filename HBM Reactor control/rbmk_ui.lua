@@ -1,5 +1,5 @@
--- RBMK反应堆监控系统 - 增强版
--- 基于colors.lua的视觉风格，包含菜单系统和自动安全功能
+-- RBMK反应堆监控系统
+-- 抄了大佬的作业，最后搞了一坨
 
 -- 引入组件库
 local component = require("component")
@@ -1031,4 +1031,5 @@ function main()
 end
 
 -- 运行主程序
+
 main()
