@@ -1,5 +1,5 @@
--- RBMK反应堆监控系统
--- 抄了大佬的作业，最后搞了一坨
+-- RBMK反应堆监控系统 - 增强版
+-- 基于colors.lua的视觉风格，包含菜单系统和自动安全功能
 
 -- 引入组件库
 local component = require("component")
@@ -8,6 +8,8 @@ local term = require("term")
 local computer = require("computer")
 local os = require("os")
 local keyboard = require("keyboard")
+local serialization = require("serialization")
+local filesystem = require("filesystem")
 
 -- 配置参数
 local SCREEN_WIDTH, SCREEN_HEIGHT = 160, 50  -- 加宽界面
@@ -22,8 +24,8 @@ local status_message = ""       -- 状态消息
 local message_time = 0          -- 消息显示时间
 local settings = {
     max_temperature = 2500,     -- 默认最高温度
-    control_rod_level = 0.5,    -- 默认控制棒水平
-    auto_emergency = true,      -- 自动紧急停堆
+    control_rod_level = 0.0,    -- 默认控制棒水平
+    auto_emergency = false,      -- 自动紧急停堆
     xenon_threshold = 0.8,      -- 氙中毒阈值
     temperature_threshold = 0.9 -- 温度阈值百分比
 }
@@ -33,6 +35,8 @@ local input_mode = false        -- 输入模式
 local input_buffer = ""         -- 输入缓冲区
 local input_prompt = ""         -- 输入提示
 local input_default = ""        -- 输入默认值
+local settings_file = "/home/settings.cfg" -- 设置文件路径
+local force_redraw = false      -- 强制重绘标志
 
 -- 初始化函数
 function init()
@@ -66,9 +70,44 @@ function init()
         end
     end
     
+    -- 加载保存的设置
+    load_settings()
+    
     -- 初始化完成
     print("RBMK监控系统初始化完成")
     return true
+end
+
+-- 保存设置到文件
+function save_settings()
+    local file = io.open(settings_file, "w")
+    if file then
+        file:write(serialization.serialize(settings))
+        file:close()
+        print("设置已保存到: " .. settings_file)
+        return true
+    else
+        print("无法保存设置到文件: " .. settings_file)
+        return false
+    end
+end
+
+-- 从文件加载设置
+function load_settings()
+    if filesystem.exists(settings_file) then
+        local file = io.open(settings_file, "r")
+        if file then
+            local content = file:read("*a")
+            file:close()
+            local success, loaded_settings = pcall(serialization.unserialize, content)
+            if success and loaded_settings then
+                settings = loaded_settings
+                print("已加载保存的设置")
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- 绘制控制棒位置 (基于colors.lua)
@@ -263,9 +302,140 @@ function perform_az5()
     return success
 end
 
+-- 绘制选中柱体详细信息
+function draw_selected_component_info()
+    local info_x = 130  -- 信息面板起始X坐标
+    local info_y = 5    -- 信息面板起始Y坐标
+    
+    -- 清空信息区域
+    gpu.setBackground(0x000000)
+    gpu.fill(info_x, info_y, SCREEN_WIDTH - info_x, 30, " ")
+    
+    -- 绘制标题
+    gpu.setForeground(0xFFFFFF)
+    gpu.set(info_x, info_y, "选中柱体详细信息:")
+    gpu.set(info_x, info_y + 1, "位置: " .. selected_x .. ", " .. selected_y)
+    
+    -- 获取选中柱体的信息
+    local info = reactor_console.getColumnData(selected_x, selected_y)
+    if not info then
+        gpu.set(info_x, info_y + 3, "该位置没有组件")
+        return
+    end
+    
+    -- 显示基本信息
+    gpu.set(info_x, info_y + 3, "类型: " .. (info.type or "未知"))
+    
+    -- 根据类型显示详细信息
+    if info.type == "FUEL" or info.type == "FUEL_SIM" then
+        gpu.set(info_x, info_y + 5, "温度: " .. string.format("%.1f", info.coreSkinTemp or 0) .. "°C")
+        gpu.set(info_x, info_y + 6, "富集度: " .. string.format("%.2f", info.enrichment or 0))
+        
+        if info.xenon then
+            gpu.set(info_x, info_y + 7, "氙中毒: " .. string.format("%.3f", info.xenon))
+            
+            -- 根据氙中毒程度显示警告
+            if info.xenon > 0.7 then
+                gpu.setForeground(0xFF0000)
+                gpu.set(info_x, info_y + 8, "警告: 氙中毒严重!")
+                gpu.setForeground(0xFFFFFF)
+            elseif info.xenon > 0.4 then
+                gpu.setForeground(0xFFFF00)
+                gpu.set(info_x, info_y + 8, "注意: 氙中毒中度")
+                gpu.setForeground(0xFFFFFF)
+            end
+        end
+        
+        -- 温度状态指示
+        local temp_status = ""
+        local temp_color = 0xFFFFFF
+        if info.coreSkinTemp > settings.max_temperature then
+            temp_status = "危险! 超过最高温度"
+            temp_color = 0xFF0000
+        elseif info.coreSkinTemp > settings.max_temperature * 0.8 then
+            temp_status = "警告! 接近最高温度"
+            temp_color = 0xFFFF00
+        elseif info.coreSkinTemp > settings.max_temperature * 0.6 then
+            temp_status = "注意: 温度较高"
+            temp_color = 0xFFA500
+        else
+            temp_status = "正常"
+            temp_color = 0x00FF00
+        end
+        
+        gpu.setForeground(temp_color)
+        gpu.set(info_x, info_y + 9, "温度状态: " .. temp_status)
+        gpu.setForeground(0xFFFFFF)
+        
+    elseif info.type == "CONTROL" then
+        gpu.set(info_x, info_y + 5, "水平: " .. string.format("%.3f", info.level or 0))
+        
+        -- 控制棒状态指示
+        local rod_status = ""
+        local rod_color = 0xFFFFFF
+        if info.level > 0.8 then
+            rod_status = "完全插入"
+            rod_color = 0x0000FF
+        elseif info.level > 0.5 then
+            rod_status = "部分插入"
+            rod_color = 0x0066FF
+        elseif info.level > 0.2 then
+            rod_status = "部分抽出"
+            rod_color = 0x00B6FF
+        else
+            rod_status = "完全抽出"
+            rod_color = 0x00FFFF
+        end
+        
+        gpu.setForeground(rod_color)
+        gpu.set(info_x, info_y + 6, "状态: " .. rod_status)
+        gpu.setForeground(0xFFFFFF)
+        
+    elseif info.type == "MODERATOR" then
+        gpu.set(info_x, info_y + 5, "慢化剂 - 中子减速")
+        
+    elseif info.type == "REFLECTOR" then
+        gpu.set(info_x, info_y + 5, "反射器 - 中子反射")
+        
+    elseif info.type == "ABSORBER" then
+        gpu.set(info_x, info_y + 5, "吸收剂 - 中子吸收")
+        
+    elseif info.type == "COOLER" then
+        gpu.set(info_x, info_y + 5, "冷却器 - 热量转移")
+        
+    elseif info.type == "HEATEX" then
+        gpu.set(info_x, info_y + 5, "热交换器 - 热量交换")
+        
+    elseif info.type == "BOILER" then
+        gpu.set(info_x, info_y + 5, "锅炉 - 产生蒸汽")
+        
+    elseif info.type == "OUTGASSER" then
+        gpu.set(info_x, info_y + 5, "辐照通道 - 物质辐照")
+    end
+    
+    -- 显示操作提示
+    gpu.setForeground(0x888888)
+    gpu.set(info_x, info_y + 15, "使用方向键选择不同柱体")
+    gpu.set(info_x, info_y + 16, "按+/-键调整控制棒水平")
+    gpu.set(info_x, info_y + 17, "按]键精确设置控制棒水平")
+    gpu.set(info_x, info_y + 18, "按TAB键强制刷新界面")
+end
+
 -- 绘制反应堆网格
 function draw_reactor_grid()
     local any_changed = false
+    
+    -- 强制重绘检查
+    if force_redraw then
+        any_changed = true
+        force_redraw = false
+        -- 清空组件数据缓存，强制重新获取所有数据
+        for x = 0, 14 do
+            for y = 0, 14 do
+                last_component_data[x][y] = {}
+            end
+        end
+    end
     
     -- 绘制网格边框
     gpu.setForeground(0x333333)
@@ -374,6 +544,9 @@ function draw_reactor_grid()
         end
     end
     
+    -- 绘制选中柱体详细信息
+    draw_selected_component_info()
+    
     return any_changed
 end
 
@@ -475,7 +648,7 @@ function draw_status_bar()
     gpu.set(SCREEN_WIDTH - 10, status_y + 2, time)
     
     -- 显示控制提示
-    gpu.set(1, status_y + 5, "方向键:移动选中  +/-:调整控制棒  A:AZ-5急停  M:返回菜单  S:设置  Q:退出")
+    gpu.set(1, status_y + 5, "方向键:移动选中  +/-:调整控制棒  A:AZ-5急停  M:返回菜单  S:设置  TAB:刷新界面  Q:退出")
 end
 
 -- 显示组件详细信息
@@ -663,6 +836,7 @@ function handle_menu_input()
                 elseif menu_selection == 4 then
                     settings.auto_emergency = not settings.auto_emergency
                     set_status_message("自动紧急停堆: " .. (settings.auto_emergency and "开启" or "关闭"))
+                    save_settings()
                 elseif menu_selection == 5 then
                     input_mode = true
                     input_buffer = ""
@@ -693,6 +867,7 @@ function handle_menu_input()
                     return true
                 elseif menu_selection == 3 then
                     settings.auto_emergency = not settings.auto_emergency
+                    save_settings()
                 elseif menu_selection == 4 then
                     input_mode = true
                     input_buffer = ""
@@ -758,6 +933,7 @@ function handle_settings_input()
                 return true
             elseif menu_selection == 3 then
                 settings.auto_emergency = not settings.auto_emergency
+                save_settings()
             elseif menu_selection == 4 then
                 input_mode = true
                 input_buffer = ""
@@ -871,6 +1047,12 @@ function handle_monitor_input()
             menu_selection = 1
             return true
             
+        -- TAB键强制刷新界面
+        elseif key == 15 then -- TAB键
+            force_redraw = true
+            set_status_message("强制刷新界面...")
+            return true
+            
         -- 退出程序 (按Q键)
         elseif char == 113 or char == 81 then -- 'Q' 或 'q'
             return false
@@ -903,6 +1085,7 @@ function handle_input_mode()
                     if value >= 1000 and value <= 10000 then
                         settings.max_temperature = value
                         set_status_message("最高温度已设置为: " .. value .. "°C")
+                        save_settings()
                     else
                         set_status_message("错误: 温度必须在1000-10000°C之间")
                     end
@@ -914,6 +1097,7 @@ function handle_input_mode()
                         end)
                         if success then
                             set_status_message("控制棒水平已设置为: " .. string.format("%.9f", settings.control_rod_level))
+                            save_settings()
                         else
                             set_status_message("设置控制棒失败")
                         end
@@ -924,6 +1108,7 @@ function handle_input_mode()
                     if value >= 0 and value <= 1 then
                         settings.xenon_threshold = value
                         set_status_message("氙中毒阈值已设置为: " .. string.format("%.3f", value))
+                        save_settings()
                     else
                         set_status_message("错误: 氙中毒阈值必须在0.0-1.0之间")
                     end
@@ -931,6 +1116,7 @@ function handle_input_mode()
                     if value >= 50 and value <= 100 then
                         settings.temperature_threshold = value / 100
                         set_status_message("温度阈值已设置为: " .. value .. "%")
+                        save_settings()
                     else
                         set_status_message("错误: 温度阈值必须在50-100%之间")
                     end
@@ -987,7 +1173,7 @@ function main_loop()
                 local grid_changed = draw_reactor_grid()
                 
                 -- 定期更新界面
-                if grid_changed or (current_time - last_redraw_time >= 1) then
+                if grid_changed or (current_time - last_redraw_time >= 1) or force_redraw then
                     -- 绘制温度标尺
                     draw_temperature_scale(settings.max_temperature)
                     
@@ -1019,6 +1205,8 @@ function main()
         print("系统初始化完成，开始监控...")
         set_status_message("欢迎使用RBMK反应堆监控系统")
         main_loop()
+        -- 退出前保存设置
+        save_settings()
     else
         print("初始化失败，请检查硬件连接")
     end
@@ -1031,5 +1219,4 @@ function main()
 end
 
 -- 运行主程序
-
 main()
